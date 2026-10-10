@@ -1,0 +1,170 @@
+# LibreWXR runs as a pipeline + renderer pair.
+#
+#   pipeline  - asyncio process fetching all radar / NWP / satellite /
+#               alerts / lightning data and writing a state.json
+#               snapshot under /data/cache after every fetch cycle.
+#   renderer  - N uvicorn worker processes that memmap the same files
+#               and serve tiles, bypassing the Python GIL on the render
+#               path.
+#
+# Set COMPOSE_PROFILES in your .env (the app reads the same env var to
+# pick its own defaults; any individual knob can still be overridden):
+#
+#   COMPOSE_PROFILES=multi    (normal setting; pipeline + N renderers)
+#   COMPOSE_PROFILES=single   (legacy compatibility alias - starts the
+#                              same two services; the app maps it to 1
+#                              render worker with legacy single-sized
+#                              caches and logs a startup warning)
+#
+# Deploy:  docker compose up --build -d
+#
+# See docs/single-mode-migration.md for the migration guide.  True
+# single mode (one container doing fetch + render) was removed; the git
+# tag `single-mode-final` holds the last release with it, for anyone who
+# wants to pin to that.
+#
+# A gitignored docker-compose.override.yml beside this file is auto-
+# merged for host-specific deltas (bind mounts, tunnels, etc.); no -f
+# chain needed.
+
+services:
+  # ─── MULTI MODE ─────────────────────────────────────────────────────
+  # pipeline   — single asyncio process fetching all radar / NWP /
+  #              satellite / alerts / lightning data and writing a
+  #              state.json snapshot under /data/cache after every
+  #              fetch cycle.
+  # renderer   — N uvicorn worker processes that memmap the same files
+  #              and refresh their in-memory stores when state.json
+  #              changes.  No fetcher, no upstream HTTP — only tile
+  #              rendering.
+  #
+  # Defaults below target an 80-core / 32 GB rack.  Tune LIBREWXR_WORKERS
+  # and the memory limits down for smaller hardware.
+  pipeline:
+    profiles: ["multi", "single"]
+    build: .
+    command: ["python", "-m", "librewxr.data_pipeline"]
+    env_file:
+      - .env
+    environment:
+      LIBREWXR_CACHE_DIR: /data/cache
+      LIBREWXR_LOG_FILE: /logs/librewxr.log
+      # Optional RAM-backed directory for stores regenerated every fetch
+      # cycle (nowcast frames + flows, precip masks, storm cells, RRQPE
+      # scan cache).  Uncomment in BOTH services along with the matching
+      # tmpfs bind mount below (identical source/target path) so the
+      # absolute memmap paths in state.json resolve in the pipeline and
+      # every render worker.  tmpfs pages count against the container
+      # memory limit.  See docs/configuration-reference.md.
+      # LIBREWXR_VOLATILE_CACHE_DIR: /dev/shm/librewxr
+      # Prefer the gitignored docker-compose.override.yml instead: it
+      # auto-merges over this file and survives `git pull` with no conflicts.
+    volumes:
+      - librewxr-cache:/data/cache
+      - earthkit-cache:/root/.cache/earthkit-regrid
+      - ./logs:/logs
+      # Shared host tmpfs backing LIBREWXR_VOLATILE_CACHE_DIR above.
+      # Uncomment in BOTH services (identical path on each side).
+      # - /dev/shm/librewxr:/dev/shm/librewxr
+      # Update-safe route; worked example in docs/configuration-reference.md
+      # (LIBREWXR_VOLATILE_CACHE_DIR).
+    restart: unless-stopped
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: ${LIBREWXR_PIPELINE_MEMORY:-12G}
+    # The pipeline writes the memmap files but never reopens them via
+    # __setstate__, so it has lower FD pressure than the renderer;
+    # included for symmetry and headroom during fetch bursts.  See the
+    # renderer service below for the full FD-pressure rationale.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+  renderer:
+    profiles: ["multi", "single"]
+    build: .
+    command: ["python", "-m", "librewxr.main"]
+    ports:
+      - "${LIBREWXR_PORT:-8080}:8080"
+    env_file:
+      - .env
+    environment:
+      LIBREWXR_CACHE_DIR: /data/cache
+      # render_only skips fetcher / NWP / satellite / nowcast init —
+      # the renderer reads everything from the pipeline's snapshot.
+      LIBREWXR_RENDER_ONLY: "1"
+      LIBREWXR_LOG_FILE: /logs/librewxr.log
+      # Optional RAM-backed directory for stores regenerated every fetch
+      # cycle (nowcast frames + flows, precip masks, storm cells, RRQPE
+      # scan cache).  Uncomment in BOTH services along with the matching
+      # tmpfs bind mount below (identical source/target path) so the
+      # absolute memmap paths in state.json resolve in the pipeline and
+      # every render worker.  tmpfs pages count against the container
+      # memory limit.  See docs/configuration-reference.md.
+      # LIBREWXR_VOLATILE_CACHE_DIR: /dev/shm/librewxr
+      # Prefer the gitignored docker-compose.override.yml instead: it
+      # auto-merges over this file and survives `git pull` with no conflicts.
+    volumes:
+      - librewxr-cache:/data/cache
+      - ./logs:/logs
+      # Shared host tmpfs backing LIBREWXR_VOLATILE_CACHE_DIR above.
+      # Uncomment in BOTH services (identical path on each side).
+      # - /dev/shm/librewxr:/dev/shm/librewxr
+      # Update-safe route; worked example in docs/configuration-reference.md
+      # (LIBREWXR_VOLATILE_CACHE_DIR).
+    # Render workers wait for state.json with a 300 s default timeout
+    # (LIBREWXR_STATE_WAIT_TIMEOUT).  depends_on starts the pipeline
+    # first so the wait window is shorter on cold start.
+    depends_on:
+      - pipeline
+    restart: unless-stopped
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: ${LIBREWXR_RENDER_MEMORY:-18G}
+    # LibreWXR is memmap-heavy: every radar/NWP/satellite/nowcast frame
+    # is a separate np.memmap file, and on cold start the renderer reopens
+    # all of them via __setstate__.  A fully-populated multi-region cache
+    # (12 frames x ~13 regions + 13 NWP grids x ~30 timesteps x 2 +
+    # nowcast + satellite) is 800+ open files before any tile render —
+    # the Docker default soft nofile (often 1024 on the host) blows up
+    # with EMFILE on the very first state.json reload.  65536 is ~80x
+    # the actual steady-state usage and well below any host hard limit.
+    # This is the service that was hitting EMFILE in production — the
+    # limit must cover all of those frames plus tile cache, HTTP, and
+    # render thread pools.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+  # ─── MANUAL UTILITIES ───────────────────────────────────────────────
+  # Wipe the shared cache volume.  Gated behind the "manual" profile so
+  # it doesn't run on every `up` — explicit targeting via `run` still
+  # works regardless of which mode is active.  Invoke with:
+  #   docker compose run --rm clear-cache
+  clear-cache:
+    image: alpine:latest
+    profiles: ["manual"]
+    volumes:
+      - librewxr-cache:/data/cache
+    command: sh -c "rm -rf /data/cache/* && echo 'All caches cleared'"
+    restart: "no"
+
+volumes:
+  librewxr-cache:
+  earthkit-cache:
